@@ -1,0 +1,2 @@
+ride_id,event_time,pickup_zone,distance_km,duration_min,fare,reason
+R00983,2026-10-27 08:25:01,12,0.0,27.8,28.18,zero_distance

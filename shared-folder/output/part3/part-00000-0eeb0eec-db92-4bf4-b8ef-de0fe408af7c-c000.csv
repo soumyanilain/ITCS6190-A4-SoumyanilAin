@@ -1,0 +1,4 @@
+ride_id,event_time,pickup_zone,distance_km,duration_min,payment_type,fare,prediction,deviation
+R00102,2026-10-27 08:00:49,2,8.47,34.4,card,92.77,32.83,59.94
+R00105,2026-10-27 08:02:24,3,16.4,56.0,app,62.41,53.91,8.5
+R00112,2026-10-27 08:01:10,4,8.03,27.9,card,79.48,29.72,49.76

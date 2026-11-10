@@ -79,8 +79,22 @@ def part1a_zone_windows():
     in batch over all the files, so that you can see what the watermark did.
     """
     rides = read_rides()
-    # TODO
-    return None
+    # The watermark tells Spark how late an event may be: once the max event_time seen minus
+    # 3 minutes passes the end of a window, that window is final, it is written once (append)
+    # and its state is dropped. Events that arrive for a window already closed are discarded.
+    windows = (rides.withWatermark("event_time", "3 minutes")
+               .groupBy(window(col("event_time"), "5 minutes"), col("pickup_zone"))
+               .agg(count("*").alias("trips"), sround(ssum("fare"), 2).alias("revenue"))
+               .select(col("window.start").alias("window_start"),
+                       col("window.end").alias("window_end"),
+                       "pickup_zone", "trips", "revenue"))
+    return (windows.writeStream
+            .outputMode("append")
+            .format("parquet")
+            .option("path", out_dir)
+            .option("checkpointLocation", ckpt_dir)
+            .trigger(availableNow=True)
+            .start())
 
 
 # ---------------------------------------------------------------- Part 1b: alerts
@@ -93,8 +107,22 @@ def part1b_alerts():
     """
     from pyspark.sql.functions import when
     rides = read_rides()
-    # TODO
-    return None
+    # A filter and a new column, row by row: nothing is remembered between micro-batches,
+    # so there is no state and no watermark to set.
+    alerts = (rides.filter((col("fare") > 150) | (col("distance_km") == 0))
+              .withColumn("reason", when(col("fare") > 150, lit("high_fare"))
+                                    .otherwise(lit("zero_distance")))
+              .select("ride_id", "event_time", "pickup_zone", "distance_km",
+                      "duration_min", "fare", "reason"))
+    return (alerts.writeStream
+            .outputMode("append")
+            .format("csv")
+            .option("header", True)
+            .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+            .option("path", out_dir)
+            .option("checkpointLocation", ckpt_dir)
+            .trigger(availableNow=True)
+            .start())
 
 
 # ---------------------------------------------------------------- Part 2: the fare model
@@ -140,9 +168,59 @@ def part2_train():
         print(f"{name:10s} RMSE {rmse:6.2f}   R2 {r2:6.3f}")
         results.append((name, round(rmse, 2), round(r2, 3))); models[name] = model
 
-    # TODO: baseline, full, tuned (with ParamGridBuilder and CrossValidator); evaluate(...)
-    #       each; save models[<best name>] under model_dir; return results
-    return None
+    import time
+    t_start = time.time()
+
+    # baseline: the fare from the distance alone
+    baseline = Pipeline(stages=[
+        VectorAssembler(inputCols=["distance_km"], outputCol="features"),
+        LinearRegression(featuresCol="features", labelCol="fare")])
+    evaluate("baseline", baseline.fit(trainDF))
+
+    # full: zone, payment type and hour as categories (index -> one-hot), plus distance and duration
+    cats = ["zone", "payment_type", "hour"]
+    idx_cols = [f"{c}_idx" for c in cats]
+    vec_cols = [f"{c}_vec" for c in cats]
+    indexer = StringIndexer(inputCols=cats, outputCols=idx_cols, handleInvalid="keep")
+    encoder = OneHotEncoder(inputCols=idx_cols, outputCols=vec_cols)
+    full = Pipeline(stages=[
+        indexer, encoder,
+        VectorAssembler(inputCols=vec_cols + ["distance_km", "duration_min"], outputCol="features"),
+        LinearRegression(featuresCol="features", labelCol="fare")])
+    evaluate("full", full.fit(trainDF))
+
+    # tuned: a random forest on the index columns (trees split on categories directly, no one-hot).
+    # Grid: maxDepth (how many interactions a tree can learn) x maxBins (how finely distance and
+    # duration are cut into candidate split points; 32 is coarse for a fare that grows linearly).
+    rf = RandomForestRegressor(featuresCol="features", labelCol="fare", numTrees=30, seed=seed)
+    tuned = Pipeline(stages=[
+        indexer,
+        VectorAssembler(inputCols=idx_cols + ["distance_km", "duration_min"], outputCol="features"),
+        rf])
+    grid = (ParamGridBuilder()
+            .addGrid(rf.maxDepth, [8, 10])
+            .addGrid(rf.maxBins, [32, 128])
+            .build())
+    cv = CrossValidator(estimator=tuned, estimatorParamMaps=grid, evaluator=rmse_eval,
+                        numFolds=3, parallelism=2, seed=seed)
+    t_cv = time.time()
+    cvModel = cv.fit(trainDF)
+    n_fits = len(grid) * 3 + 1                        # 3 folds per combination, plus the refit on all of trainDF
+    print(f"cross-validation: {len(grid)} combinations x 3 folds + 1 refit = {n_fits} fits, "
+          f"{time.time() - t_cv:.0f} s")
+    for pm, m in zip(cvModel.getEstimatorParamMaps(), cvModel.avgMetrics):
+        print(f"   {', '.join(f'{p.name}={v}' for p, v in pm.items())}: mean CV RMSE {m:.3f}")
+    best_pm = cvModel.getEstimatorParamMaps()[cvModel.avgMetrics.index(min(cvModel.avgMetrics))]
+    evaluate("tuned", cvModel.bestModel)
+    print(f"tuned: RandomForestRegressor numTrees=30, best "
+          f"{', '.join(f'{p.name}={v}' for p, v in best_pm.items())}")
+
+    best = min(results, key=lambda r: r[1])[0]
+    models[best].write().overwrite().save(model_dir)
+    print(f"best model: {best} (test RMSE {dict((n, r) for n, r, _ in results)[best]}), "
+          f"saved under {model_dir}")
+    print(f"part 2 took {time.time() - t_start:.0f} s")
+    return results
 
 
 # ---------------------------------------------------------------- Part 3: score the stream
@@ -155,8 +233,25 @@ def part3_score(threshold):
     with the timestampFormat option of part 1b. Trigger availableNow, checkpoint in
     ckpt_dir. Return the started query. No fit() anywhere in this function.
     """
-    # TODO
-    return None
+    # The model was fitted once, in batch, by part 2. Here it is only loaded and applied:
+    # every stage of a PipelineModel is a transformer, so it runs on a stream row by row.
+    model = PipelineModel.load(model_dir)
+    rides = features_of(read_rides(), "event_time")
+    flagged = (model.transform(rides)
+               .withColumn("deviation", sround(sabs(col("fare") - col("prediction")), 2))
+               .filter(col("deviation") > lit(threshold))
+               .select("ride_id", "event_time", "pickup_zone", "distance_km", "duration_min",
+                       "payment_type", "fare", sround(col("prediction"), 2).alias("prediction"),
+                       "deviation"))
+    return (flagged.writeStream
+            .outputMode("append")
+            .format("csv")
+            .option("header", True)
+            .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+            .option("path", out_dir)
+            .option("checkpointLocation", ckpt_dir)
+            .trigger(availableNow=True)
+            .start())
 
 
 # ---------------------------------------------------------------- main
