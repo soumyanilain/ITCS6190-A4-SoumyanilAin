@@ -1,0 +1,77 @@
+# Spark standalone cluster for Hands-on L5 to L11, variant for GitHub Codespaces.
+# Image: apache/spark:4.2.0  (Spark 4.2.0, Java 21, Scala 2.13, Python 3, SPARK_HOME=/opt/spark)
+#
+# Why a separate file: inside a Codespace, Docker runs "in Docker" and traffic between
+# containers on a Compose bridge network can be dropped. The workers then never register
+# with the master, or the executors never reach the driver, and every job waits forever with
+#
+#   WARN TaskSchedulerImpl: Initial job has not accepted any resources; check your cluster UI
+#   to ensure that workers are registered and have sufficient resources
+#
+# This variant puts every service on the host network, so the master, the workers and the
+# driver talk over loopback and never cross a bridge. Commands, paths and web UIs are the
+# same as in docker-compose.yml; Codespaces forwards 8080 and 4040 automatically.
+#
+# One consequence: on the host network both executors have the same address, so Spark takes
+# them for two processes on one machine and tries to read shuffle files straight from the
+# other executor's disk, which fails because the containers have separate filesystems. The
+# mounted conf/spark-defaults.conf turns that optimization off.
+#
+# Use:   docker compose -f docker-compose.codespaces.yml up -d
+# Stop:  docker compose -f docker-compose.codespaces.yml down
+
+x-spark: &spark
+  image: apache/spark:4.2.0
+  network_mode: host
+  # On the host network Docker does not resolve the service names, so map them to loopback.
+  extra_hosts:
+    - "spark-master:127.0.0.1"
+    - "spark-worker-1:127.0.0.1"
+    - "spark-worker-2:127.0.0.1"
+  restart: on-failure
+  volumes:
+    - ./shared-folder:/opt/spark/work-dir/shared
+    # Cluster configuration, read by spark-submit and by the PySpark shell.
+    - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+
+services:
+
+  spark-master:
+    <<: *spark
+    container_name: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      # Everything binds and advertises loopback, so the driver and the executors agree on
+      # one address. Without this, Spark picks the Codespace network interface for some
+      # components and loopback for others.
+      SPARK_LOCAL_IP: "127.0.0.1"
+      SPARK_MASTER_HOST: "spark-master"
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+
+  spark-worker-1:
+    <<: *spark
+    container_name: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "spark://spark-master:7077"]
+    environment:
+      SPARK_LOCAL_IP: "127.0.0.1"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+      # One host network means one set of ports, so the two workers need different ones.
+      SPARK_WORKER_PORT: "7078"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    depends_on: [spark-master]
+
+  spark-worker-2:
+    <<: *spark
+    container_name: spark-worker-2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "spark://spark-master:7077"]
+    environment:
+      SPARK_LOCAL_IP: "127.0.0.1"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+      SPARK_WORKER_PORT: "7079"
+      SPARK_WORKER_WEBUI_PORT: "8082"
+    depends_on: [spark-master]

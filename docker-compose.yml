@@ -1,0 +1,60 @@
+# Spark standalone cluster for Assignment 4, built on the official Apache Spark image.
+# Image: apache/spark:4.2.0  (Spark 4.2.0, Java 21, Scala 2.13, Python 3, SPARK_HOME=/opt/spark)
+#
+# One master and two workers. Compare with the Hadoop cluster from Hands-on L4: Spark on its
+# own needs no NameNode, DataNodes or NodeManagers, only a master and workers.
+
+x-spark: &spark
+  image: apache/spark:4.2.0
+  # apache/spark is published for linux/amd64 and linux/arm64, so Apple Silicon machines run
+  # it natively. If Docker ever reports a platform mismatch, uncomment the next line.
+  # platform: linux/amd64
+  restart: on-failure
+  volumes:
+    # Input files and scripts. Mounted at the same path on every container, because in
+    # standalone mode (no HDFS) each executor reads input files from its own filesystem.
+    - ./shared-folder:/opt/spark/work-dir/shared
+
+services:
+
+  spark-master:
+    <<: *spark
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+    ports:
+      - "8080:8080"   # Master UI
+      - "7077:7077"   # master RPC, where workers and applications connect
+      - "4040:4040"   # UI of an application whose driver runs on this container
+
+  spark-worker-1:
+    <<: *spark
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    ports:
+      - "8081:8081"   # Worker UI
+    depends_on: [spark-master]
+
+  spark-worker-2:
+    <<: *spark
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    ports:
+      - "8082:8081"   # Worker UI (host port 8082, since 8081 is taken by worker 1)
+    depends_on: [spark-master]
